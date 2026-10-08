@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LeadLens</title>
+<style>
+:root{--bg:#0f1115;--panel:#181b22;--line:#2a2f3a;--text:#e8eaf0;--mut:#8b93a7;--acc:#f0c94a;
+--hot:#ef6461;--warm:#f0a23b;--cold:#6b7a99;--ok:#4cc38a}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text)}
+header{display:flex;align-items:center;justify-content:space-between;padding:16px 24px;border-bottom:1px solid var(--line)}
+h1{font-size:18px;margin:0;letter-spacing:.12em}h1 span{color:var(--acc)}
+.wrap{max-width:1200px;margin:0 auto;padding:20px 24px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px;margin-bottom:16px}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.stat b{display:block;font-size:22px}.stat small{color:var(--mut)}
+.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:14px}
+input,select,button{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit}
+button{cursor:pointer}button.primary{background:var(--acc);color:#1b1b1b;border-color:var(--acc);font-weight:600}
+button:hover{filter:brightness(1.1)}
+table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mut);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.05em}
+tr:hover td{background:#1d212a}
+.badge{display:inline-block;min-width:44px;text-align:center;padding:2px 8px;border-radius:99px;font-weight:700;color:#111}
+.hot{background:var(--hot)}.warm{background:var(--warm)}.cold{background:var(--cold);color:#fff}
+.pill{font-size:11px;padding:1px 7px;border-radius:99px;border:1px solid var(--line);color:var(--mut)}
+.pill.valid{color:var(--ok);border-color:var(--ok)}.pill.invalid{color:var(--hot);border-color:var(--hot)}
+.pill.risky{color:var(--warm);border-color:var(--warm)}
+.mut{color:var(--mut)}
+dialog{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:12px;max-width:560px;width:92%}
+dialog::backdrop{background:#000a}
+pre{white-space:pre-wrap;background:#0f1115;padding:12px;border-radius:8px;border:1px solid var(--line)}
+li{margin:2px 0}.empty{padding:40px;text-align:center;color:var(--mut)}
+label{display:block;margin:8px 0 2px;color:var(--mut);font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>LEAD<span>LENS</span></h1>
+  <div class="bar" style="margin:0">
+    <button id="icpBtn">Tune ICP</button>
+    <button id="sampleBtn">Load sample data</button>
+    <label class="primary" style="margin:0"><input id="file" type="file" accept=".csv" hidden>
+      <button class="primary" onclick="document.getElementById('file').click()">Upload CSV</button></label>
+    <button id="exportBtn">Export CSV</button>
+  </div>
+</header>
+<div class="wrap">
+  <div class="stats" id="stats"></div>
+  <div class="bar">
+    <input id="q" placeholder="Search name, company, title, industry…" style="flex:1;min-width:220px">
+    <select id="tier"><option value="">All tiers</option><option value="hot">Hot (75+)</option>
+      <option value="warm">Warm (50-74)</option><option value="cold">Cold (&lt;50)</option></select>
+    <select id="email"><option value="">Any email</option><option value="valid">Valid only</option>
+      <option value="risky">Risky</option><option value="invalid">Invalid</option></select>
+    <select id="status"><option value="">Any status</option><option>new</option><option>contacted</option>
+      <option>qualified</option><option>rejected</option></select>
+  </div>
+  <div id="msg" class="mut" style="margin-bottom:8px"></div>
+  <table><thead><tr><th>Score</th><th>Lead</th><th>Company</th><th>Email</th><th>Status</th><th></th></tr></thead>
+  <tbody id="rows"></tbody></table>
+</div>
+
+<dialog id="dlg"><div id="dlgBody"></div><p style="text-align:right"><button onclick="dlg.close()">Close</button></p></dialog>
+
+<script>
+const $ = id => document.getElementById(id);
+const dlg = $('dlg');
+function el(tag, props = {}, ...kids) {           // XSS-safe DOM builder (textContent only)
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) k === 'class' ? n.className = v : k.startsWith('on') ? n.addEventListener(k.slice(2), v) : n[k] = v;
+  kids.flat().forEach(c => n.append(c));
+  return n;
+}
+const api = (p, o) => fetch('/api' + p, o).then(async r => { if (!r.ok) throw new Error((await r.json()).detail || r.statusText); return r.json(); });
+let timer; const debounce = f => { clearTimeout(timer); timer = setTimeout(f, 200); };
+
+async function loadStats() {
+  const s = await api('/stats'), box = $('stats'); box.replaceChildren();
+  [['Total', s.total], ['Hot', s.hot], ['Warm', s.warm], ['Cold', s.cold], ['Valid emails', s.valid_emails], ['Avg score', s.avg_score]]
+    .forEach(([k, v]) => box.append(el('div', {class: 'stat'}, el('b', {textContent: v}), el('small', {textContent: k}))));
+}
+
+async function loadLeads() {
+  const p = new URLSearchParams();
+  if ($('q').value) p.set('q', $('q').value);
+  if ($('tier').value) p.set('tier_', $('tier').value);
+  if ($('email').value) p.set('email_status', $('email').value);
+  if ($('status').value) p.set('status', $('status').value);
+  const rows = await api('/leads?' + p), body = $('rows'); body.replaceChildren();
+  if (!rows.length) { body.append(el('tr', {}, el('td', {colSpan: 6, class: 'empty', textContent: 'No leads yet. Upload a CSV or load the sample data.'}))); return; }
+  rows.forEach(r => {
+    const st = el('select', {onchange: e => api('/leads/' + r.id, {method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({status: e.target.value})}).then(loadStats)},
+      ...['new', 'contacted', 'qualified', 'rejected'].map(s => el('option', {textContent: s, selected: s === r.status})));
+    body.append(el('tr', {},
+      el('td', {}, el('span', {class: 'badge ' + r.tier, textContent: r.score, title: 'Click “Why?” for the breakdown'})),
+      el('td', {}, el('b', {textContent: r.name || '—'}), el('div', {class: 'mut', textContent: r.title || ''})),
+      el('td', {}, el('div', {textContent: r.company || '—'}), el('div', {class: 'mut', textContent: [r.industry, r.employees && r.employees + ' emp'].filter(Boolean).join(' · ')})),
+      el('td', {}, el('div', {textContent: r.email || '—'}), el('span', {class: 'pill ' + r.email_status, textContent: r.email_status})),
+      el('td', {}, st),
+      el('td', {}, el('button', {textContent: 'Why?', onclick: () => showWhy(r)}), ' ', el('button', {textContent: 'Draft', onclick: () => showDraft(r)}))));
+  });
+}
+const refresh = () => Promise.all([loadStats(), loadLeads()]);
+
+function showWhy(r) {
+  $('dlgBody').replaceChildren(el('h3', {textContent: `${r.name || r.company} — ${r.score}/100`}),
+    el('ul', {}, r.reasons.map(x => el('li', {textContent: x}))));
+  dlg.showModal();
+}
+async function showDraft(r) {
+  const d = await api(`/leads/${r.id}/outreach`);
+  $('dlgBody').replaceChildren(el('h3', {textContent: 'Outreach draft'}), el('b', {textContent: d.subject}), el('pre', {textContent: d.body}),
+    el('button', {textContent: 'Copy', onclick: () => navigator.clipboard.writeText(d.subject + '\n\n' + d.body)}));
+  dlg.showModal();
+}
+
+async function uploadFile(file) {
+  const fd = new FormData(); fd.append('file', file);
+  try {
+    const r = await api('/upload', {method: 'POST', body: fd});
+    $('msg').textContent = `Imported ${r.added} new leads · merged ${r.duplicates_merged} duplicates · skipped ${r.skipped} empty rows`;
+  } catch (e) { $('msg').textContent = 'Upload failed: ' + e.message; }
+  refresh();
+}
+$('file').onchange = e => e.target.files[0] && uploadFile(e.target.files[0]);
+$('sampleBtn').onclick = async () => uploadFile(new File([await (await fetch('/sample_leads.csv')).blob()], 'sample.csv'));
+$('exportBtn').onclick = () => location.href = '/api/export.csv';
+['q', 'tier', 'email', 'status'].forEach(i => $(i).addEventListener('input', () => debounce(loadLeads)));
+
+$('icpBtn').onclick = async () => {
+  const icp = await api('/icp'), f = {};
+  const field = (key, label, val) => [el('label', {textContent: label}), f[key] = el('input', {value: val, style: 'width:100%'})];
+  $('dlgBody').replaceChildren(el('h3', {textContent: 'Ideal Customer Profile'}),
+    ...field('industries', 'Industries (comma-separated)', icp.industries.join(', ')),
+    ...field('min', 'Min employees', icp.min_employees), ...field('max', 'Max employees', icp.max_employees),
+    ...field('locations', 'Locations (comma-separated)', icp.locations.join(', ')),
+    ...field('weights', 'Weights JSON (must sum to 100)', JSON.stringify(icp.weights)),
+    el('p', {}, el('button', {class: 'primary', textContent: 'Save & re-score', onclick: async () => {
+      const list = v => v.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+      try {
+        await api('/icp', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({
+          industries: list(f.industries.value), min_employees: +f.min.value, max_employees: +f.max.value,
+          target_titles: icp.target_titles, locations: list(f.locations.value), weights: JSON.parse(f.weights.value)})});
+        dlg.close(); refresh();
+      } catch (e) { alert(e.message); }
+    }})));
+  dlg.showModal();
+};
+refresh();
+</script>
+</body>
+</html>
